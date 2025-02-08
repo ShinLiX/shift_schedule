@@ -5,7 +5,7 @@ This Python-based scheduling tool assigns employees to shifts while satisfying v
 
 The generated schedule is exported to a CSV with intuitive tables for easy analysis and usage.
 
----
+
 
 ## **Features**
 
@@ -30,14 +30,14 @@ The resulting schedule is exported in a user-friendly format:
    - Desired shift count
    - Actual shift count
 
----
+
 
 ## **Technologies Used**
 - **Python**
 - **Google OR-Tools (CP-SAT Solver)** for constraint satisfaction modeling
 - **pandas** for data manipulation and CSV export
 
----
+
 
 ## **How It Works**
 1. Define employees, availability, and constraints in an input configuration file (e.g., JSON or CSV).
@@ -50,7 +50,7 @@ The resulting schedule is exported in a user-friendly format:
    - A **time vs. day grid** for shift visualization.
    - A **summary table** for performance review and adjustments.
 
----
+
 
 ## **Getting Started**
 
