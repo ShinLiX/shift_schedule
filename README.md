@@ -13,7 +13,7 @@ The generated schedule is exported to a CSV with intuitive tables for easy analy
 The tool enforces the following **hard constraints**:
 - **Coverage Requirement**: Each time slot must have exactly 2 employees.
 - **Shift Lengths**: Employees are assigned single shifts of 6–8 hours (or shorter if daily availability is less than 6 hours).
-- **Weekly Hour Limits**: Employees cannot exceed their predefined weekly working hours.
+- **Weekly Hour Limits**: Employees cannot exceed their predefined weekly working hours (40 hours per week by default for full time employees. However, managers have the authority to adjust this limit as needed).
 - **Forbidden Pairs**: Prevents specific pairs of employees from being assigned to the same shift.
 - **Shift Continuity**: Day-based single-shift patterns are strictly enforced.
 
@@ -62,5 +62,11 @@ The resulting schedule is exported in a user-friendly format:
 ### **Installation**
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/shift-scheduler.git
-   cd shift-scheduler
+   git clone https://github.com/ShinLiX/shift_schedule.git
+   cd shift_schedule
+2. Install dependencies
+    ```bash
+    pip install -r requirements.txt
+3. Run the script
+    ```bash
+    python scheduler.py
