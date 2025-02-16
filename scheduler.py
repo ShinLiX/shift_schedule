@@ -4,7 +4,7 @@ from tkinter import messagebox, filedialog
 import csv
 from ortools.sat.python import cp_model
 
-# ========================== 1) Support Functions ==========================
+# ========================== 1) Support / Common ==========================
 
 def compute_total_weekly_availability(employees_availability):
     """Return {employee: total # of available weekly slots (0..83)}."""
@@ -21,45 +21,43 @@ def is_contiguous_ones(bits):
 
 def generate_day_patterns(availability_mask, min_block=6, max_block=8):
     """
-    For a single day of 12 hours => sum=0 => off,
-    if sum(availability_mask)<6 => fill smaller block if contiguous or off,
-    else => one contiguous block in [6..8] or off.
-    Return patterns of length=13 => 12 bits + 1 bit for 'workedBit' (did we work?).
+    For a single day (12 hours => 0..11):
+      - if sum(availability_mask)<6 => fill entire smaller block if contiguous or off
+      - else => one contiguous block in [6..8] or off
+      - return patterns of length=13 => 12 bits + 1 workedBit
     """
     n = sum(availability_mask)
     valid_pats = []
     for mask in range(1<<12):
         pat = [(mask >> i)&1 for i in range(12)]
-        # Must be subset of availability
+        # Must be subset
         if any(pat[i]==1 and availability_mask[i]==0 for i in range(12)):
             continue
 
         total_ones = sum(pat)
         worked_bit = 1 if total_ones>0 else 0
 
-        if n < min_block:
-            # if daily availability <6 => either sum=0 (off) or fill entire block= n if contiguous
-            if total_ones == 0:
+        if n< min_block:
+            if total_ones==0:
                 valid_pats.append(pat+[0])
-            elif total_ones == n:
-                # must match availability + contiguous
-                same = True
+            elif total_ones==n:
+                # must match availability exactly & be contiguous
+                same=True
                 for i in range(12):
-                    if pat[i] != availability_mask[i]:
+                    if pat[i]!= availability_mask[i]:
                         same=False
                         break
                 if same and is_contiguous_ones(pat):
                     valid_pats.append(pat+[1])
         else:
-            if total_ones == 0:
+            if total_ones==0:
                 valid_pats.append(pat+[0])
             else:
                 if (min_block<= total_ones <= max_block) and is_contiguous_ones(pat):
                     valid_pats.append(pat+[1])
     return valid_pats
 
-
-# ========================== 2) Main Solve: coverage=2 EXACT ==========================
+# ========================== 2) Main Solve => coverage=2 EXACT ==========================
 def solve_scheduling_main(
     employees_availability,
     global_min_hours=16,
@@ -68,8 +66,8 @@ def solve_scheduling_main(
     desired_shifts=None
 ):
     """
-    EXACT coverage=2 approach. If infeasible => returns None.
-    Single-shift logic, min/max hours, forbidden pairs, desired shifts etc.
+    EXACT coverage=2 each hour. If infeasible => returns None.
+    Single-shift logic, min/max hours, forbidden pairs, desired_shifts in [1,2 => forced, else <=].
     """
     if forbidden_pairs is None:
         forbidden_pairs=[]
@@ -81,6 +79,7 @@ def solve_scheduling_main(
     slots_per_day=12
     total_slots= days*slots_per_day
 
+    # x[e,s]=1 => e works slot s
     x={}
     for e in employees_availability:
         for s in range(total_slots):
@@ -91,9 +90,9 @@ def solve_scheduling_main(
         model.Add( sum(x[(e,s)] for e in employees_availability) == 2 )
 
     # if not in availability => x[e,s]=0
-    for e,availset in employees_availability.items():
+    for e,avset in employees_availability.items():
         for s in range(total_slots):
-            if s not in availset:
+            if s not in avset:
                 model.Add(x[(e,s)]==0)
 
     # min/max hours
@@ -101,55 +100,58 @@ def solve_scheduling_main(
     weekly_hours={}
     for e in employees_availability:
         ds= desired_shifts[e]
-        eff_min= 0 if (tot_avail[e]<global_min_hours or ds*8<global_min_hours) else global_min_hours
-        weekly_hours[e]= sum(x[(e,s)] for s in range(total_slots))
-        model.Add(weekly_hours[e] >= eff_min)
-        model.Add(weekly_hours[e] <= global_max_hours)
+        eff_min= 0
+        if not (tot_avail[e]< global_min_hours or ds*8< global_min_hours):
+            eff_min= global_min_hours
 
-    # forbidden pairs => x[e1,s]+ x[e2,s]<=1
+        weekly_hours[e]= sum(x[(e,s)] for s in range(total_slots))
+        model.Add( weekly_hours[e]>= eff_min )
+        model.Add( weekly_hours[e]<= global_max_hours)
+
+    # forbidden pairs => x[e1,s]+ x[e2,s] <=1
     for (emp1,emp2) in forbidden_pairs:
         if emp1 in employees_availability and emp2 in employees_availability:
             for s in range(total_slots):
-                model.Add(x[(emp1,s)] + x[(emp2,s)] <= 1)
+                model.Add(x[(emp1,s)] + x[(emp2,s)]<=1)
 
-    # day-based single shift pattern
+    # day-based single shift => generate patterns
     day_pattern_index={}
     day_worked={}
     all_patterns={}
     for e in employees_availability:
         all_patterns[e]={}
         for d in range(days):
+            base= d*12
             avmask=[]
-            startSlot= d*slots_per_day
-            for i in range(slots_per_day):
-                slot_id= startSlot + i
+            for i in range(12):
+                slot_id= base + i
                 avmask.append(1 if slot_id in employees_availability[e] else 0)
 
             valid_pats= generate_day_patterns(avmask,6,8)
-            patIdx= model.NewIntVar(0,len(valid_pats)-1, f"patIndex_{e}_{d}")
+            patIdx= model.NewIntVar(0, len(valid_pats)-1, f"patIndex_{e}_{d}")
             day_pattern_index[(e,d)] = patIdx
             day_worked[(e,d)] = model.NewBoolVar(f"dayWorked_{e}_{d}")
             all_patterns[e][d]= valid_pats
 
     for e in employees_availability:
         for d in range(days):
-            day_vars= [ x[(e,d*12 + i)] for i in range(12)]
-            plus= day_vars + [ day_worked[(e,d)], day_pattern_index[(e,d)] ]
+            day_vars= [ x[(e,d*12 + i)] for i in range(12) ]
+            plus= day_vars + [day_worked[(e,d)], day_pattern_index[(e,d)]]
             table=[]
             for idx, pat in enumerate(all_patterns[e][d]):
                 row= pat[:12] + [pat[12], idx]
                 table.append(row)
             model.AddAllowedAssignments(plus, table)
 
-    # total_shifts => sum(day_worked[e,d])
+    # total_shifts => sum day_worked
     total_shifts={}
     diffs=[]
     for e in employees_availability:
         sumDays= [ day_worked[(e,d)] for d in range(days)]
         total_shifts[e]= model.NewIntVar(0,7,f"total_shifts_{e}")
-        model.Add( sum(sumDays) == total_shifts[e])
+        model.Add( sum(sumDays)== total_shifts[e])
 
-    # handle desired shifts
+    # desired_shifts => forced if in [1,2], else <= ds => min difference
     for e in employees_availability:
         ds= desired_shifts[e]
         if ds in [1,2]:
@@ -158,20 +160,18 @@ def solve_scheduling_main(
             model.Add( total_shifts[e]<= ds )
             diffUp= model.NewIntVar(0,7,f"diffUp_{e}")
             diffDown= model.NewIntVar(0,7,f"diffDown_{e}")
-            model.Add( total_shifts[e] - ds <= diffUp )
-            model.Add( ds - total_shifts[e] <= diffDown )
+            model.Add( total_shifts[e]- ds <= diffUp )
+            model.Add( ds- total_shifts[e] <= diffDown )
             diffs.append(diffUp)
             diffs.append(diffDown)
 
     model.Minimize( sum(diffs) )
-
     solver= cp_model.CpSolver()
     status= solver.Solve(model)
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
         return None, None, status, None
 
-    # build schedule
-    schedule= { e:[] for e in employees_availability }
+    schedule= { e:[] for e in employees_availability}
     for e in employees_availability:
         for s in range(total_slots):
             if solver.Value(x[(e,s)])==1:
@@ -179,7 +179,7 @@ def solve_scheduling_main(
     return schedule, solver, status, total_shifts
 
 
-# ========================== 3) Fallback Solve: coverage ≤2, maximize coverage ==========================
+# ========================== 3) Fallback: coverage ≤2, single contiguous block or full day (12) per day ==========================
 def solve_scheduling_fallback(
     employees_availability,
     global_min_hours=16,
@@ -188,9 +188,10 @@ def solve_scheduling_fallback(
     desired_shifts=None
 ):
     """
-    If main solve fails, do partial coverage => sum(x[e,s])<=2, maximize total coverage. 
-    Keep single-shift constraints, min/max hours, forbidden pairs, desired shifts, etc.
-    Some hours might remain uncovered => occupant=NA in CSV
+    If main solve fails, fallback coverage <=2. 
+    Each day => coverage_mask in [0..1]^12 with sum=0, sum=12, or single contiguous block => coverage=2 in that block, else 0.
+    Also keep single-shift logic, min/max hours, forbidden pairs, desired shifts in [1,2 => forced, else <=].
+    Maximize coverage minus shift diffs.
     """
     if forbidden_pairs is None:
         forbidden_pairs=[]
@@ -202,66 +203,95 @@ def solve_scheduling_fallback(
     slots_per_day=12
     total_slots= days*slots_per_day
 
+    # coverage_mask[(d,h)] in {0,1} => if 1 => coverage=2 that hour, else coverage=0
+    coverage_mask={}
+    for d in range(days):
+        for h in range(slots_per_day):
+            coverage_mask[(d,h)] = model.NewBoolVar(f"covMask_{d}_{h}")
+
+    # day-based => sum(coverage_mask[d,h]) in {0,12 or contiguous block}
+    for d in range(days):
+        day_mask_vars= [ coverage_mask[(d,h)] for h in range(slots_per_day)]
+        valid_daycov=[]
+        # enumerate all 2^12 => if sum=0 => all off, sum=12 => all on, or sum>0<12 => must be contiguous
+        for mask in range(1<<12):
+            pat= [(mask >> i)&1 for i in range(slots_per_day)]
+            s_cov= sum(pat)
+            if s_cov==0 or s_cov==12:
+                valid_daycov.append(pat)
+            else:
+                # must be contiguous if sum>0 <12
+                if is_contiguous_ones(pat):
+                    valid_daycov.append(pat)
+        model.AddAllowedAssignments(day_mask_vars, valid_daycov)
+
+    # define x[e,s] => employee e works slot s => if coverage_mask[d,h]=1 => sum(x[e,d*12+h])=2, else=0
     x={}
     for e in employees_availability:
         for s in range(total_slots):
             x[(e,s)] = model.NewBoolVar(f'x_{e}_{s}')
 
-    # coverage <=2
-    for s in range(total_slots):
-        model.Add( sum(x[(e,s)] for e in employees_availability ) <= 2 )
+    # link coverage_mask => sum(x[e,s])= coverage_mask*(2)
+    for d in range(days):
+        for h in range(slots_per_day):
+            s_id= d*slots_per_day + h
+            # sum(x[e,s_id])= coverage_mask[d,h]*2
+            model.Add( sum(x[(e,s_id)] for e in employees_availability) == 2* coverage_mask[(d,h)] )
 
-    # availability
+    # if not in availability => x[e,s]=0
     for e,avset in employees_availability.items():
         for s in range(total_slots):
             if s not in avset:
                 model.Add(x[(e,s)]==0)
 
-    # min/max hours
-    tot_avail= compute_total_weekly_availability(employees_availability)
-    weekly_hours={}
-    for e in employees_availability:
-        ds= desired_shifts[e]
-        eff_min= 0 if (tot_avail[e]<global_min_hours or ds*8<global_min_hours) else global_min_hours
-        weekly_hours[e]= sum(x[(e,s)] for s in range(total_slots))
-        model.Add(weekly_hours[e]>= eff_min)
-        model.Add(weekly_hours[e]<= global_max_hours)
-
-    # forbidden
-    for (emp1,emp2) in forbidden_pairs:
-        if emp1 in employees_availability and emp2 in employees_availability:
-            for s in range(total_slots):
-                model.Add(x[(emp1,s)] + x[(emp2,s)]<=1)
-
-    # day-based single shift
+    # single-shift logic
     day_pattern_index={}
     day_worked={}
     all_patterns={}
     for e in employees_availability:
         all_patterns[e]={}
         for d in range(days):
+            base= d*slots_per_day
             avmask=[]
-            startSlot= d*12
-            for i in range(12):
-                slot_id= startSlot + i
+            for i in range(slots_per_day):
+                slot_id= base + i
                 avmask.append(1 if slot_id in employees_availability[e] else 0)
             valid_pats= generate_day_patterns(avmask,6,8)
-            patIdx= model.NewIntVar(0,len(valid_pats)-1,f"fb_patIndex_{e}_{d}")
-            day_pattern_index[(e,d)]= patIdx
-            day_worked[(e,d)] = model.NewBoolVar(f"fb_dayWorked_{e}_{d}")
+            patIdx= model.NewIntVar(0,len(valid_pats)-1, f"fbEmp_patIndex_{e}_{d}")
+            day_pattern_index[(e,d)] = patIdx
+            day_worked[(e,d)] = model.NewBoolVar(f"fbEmp_dayWorked_{e}_{d}")
             all_patterns[e][d]= valid_pats
 
     for e in employees_availability:
         for d in range(days):
-            day_vars= [x[(e,d*12 + i)] for i in range(12)]
-            plus= day_vars + [ day_worked[(e,d)], day_pattern_index[(e,d)] ]
+            day_vars_emp= [ x[(e,d*12 + i)] for i in range(12)]
+            plus= day_vars_emp + [ day_worked[(e,d)], day_pattern_index[(e,d)] ]
             table=[]
             for idx, pat in enumerate(all_patterns[e][d]):
-                row= pat[:12]+ [pat[12], idx]
+                row= pat[:12] + [pat[12], idx]
                 table.append(row)
             model.AddAllowedAssignments(plus, table)
 
-    # desired shifts => min difference
+    # min/max hours
+    tot_avail= compute_total_weekly_availability(employees_availability)
+    weekly_hours={}
+    for e in employees_availability:
+        ds= desired_shifts[e]
+        eff_min=0
+        if not (tot_avail[e]<global_min_hours or ds*8<global_min_hours):
+            eff_min= global_min_hours
+        wh= sum( x[(e,s)] for s in range(total_slots))
+        weekly_hours[e]= wh
+        model.Add( wh>= eff_min )
+        model.Add( wh<= global_max_hours)
+
+    # forbidden pairs => x[e1,s]+ x[e2,s]<=1
+    for (emp1,emp2) in forbidden_pairs:
+        if emp1 in employees_availability and emp2 in employees_availability:
+            for s in range(total_slots):
+                model.Add( x[(emp1,s)] + x[(emp2,s)]<=1 )
+
+    # desired shifts => sum day_worked => min difference
     total_shifts={}
     diffs=[]
     for e in employees_availability:
@@ -276,102 +306,70 @@ def solve_scheduling_fallback(
             diffUp= model.NewIntVar(0,7,f"fb_diffUp_{e}")
             diffDown= model.NewIntVar(0,7,f"fb_diffDown_{e}")
             model.Add( total_shifts[e]- ds <= diffUp )
-            model.Add( ds - total_shifts[e] <= diffDown )
+            model.Add( ds- total_shifts[e] <= diffDown )
             diffs.append(diffUp)
             diffs.append(diffDown)
 
-    # define coverage_sum => sum of all x[e,s]
+    # coverage_sum => sum( coverage_mask*(2) ) => we want to maximize coverage
     coverage_sum= model.NewIntVar(0,7*12*2,"coverage_sum")
-    model.Add( coverage_sum == sum(x[(e,s)] for e in employees_availability for s in range(total_slots)) )
+    model.Add( coverage_sum == sum( coverage_mask[(d,h)]*2 for d in range(days) for h in range(slots_per_day)) )
 
-    # Weighted approach => maximize coverage_sum*1000 - sum(diffs) 
-    # => prioritize coverage first, then shift difference
-    model.Maximize( coverage_sum*1000 - sum(diffs) )
+    # Weighted approach => coverage_sum*1000 - sum(diffs)
+    model.Maximize( coverage_sum*1000 - sum(diffs))
 
     solver= cp_model.CpSolver()
     status= solver.Solve(model)
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
         return None, None, status, None
 
+    # build schedule => x[e,s]==1 => e works slot s
     schedule= { e:[] for e in employees_availability}
     for e in employees_availability:
         for s in range(total_slots):
-            if solver.Value(x[(e,s)])==1:
+            if solver.Value( x[(e,s)])==1:
                 schedule[e].append(s)
     return schedule, solver, status, total_shifts
 
 
-# ========================== 4) CSV Export w/ NA for partial coverage ==========================
-def export_schedule_to_csv(schedule, employees, solver, total_shifts_vars, desired_shifts, filename="schedule.csv"):
+# ========================== 4) CSV export => occupant repeated each hour, "NA" for partial coverage ==========================
+def export_schedule_to_csv(
+    schedule, 
+    employees, 
+    solver, 
+    total_shifts_vars, 
+    desired_shifts, 
+    filename="schedule.csv"
+):
+    """
+    We skip occupant continuity merges. For each day/hour => occupant1, occupant2 => if coverage=0 => both=NA, if coverage=1 => occupant2=NA
+    leftover NA hours are contiguous in fallback, occupant repeated each hour
+    """
     days=7
     slots_per_day=12
     day_names= ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
-    # build occupant info
-    day_hour_emps= { d: {h: [] for h in range(slots_per_day)} for d in range(days)}
-    coverage_count= { (d,h):0 for d in range(days) for h in range(slots_per_day)}
-
+    day_hour_emps= { d:{h: [] for h in range(slots_per_day)} for d in range(days)}
     for e in employees:
-        for slot_id in schedule[e]:
-            d= slot_id// slots_per_day
-            h= slot_id% slots_per_day
+        for s in schedule[e]:
+            d= s// slots_per_day
+            h= s%  slots_per_day
             day_hour_emps[d][h].append(e)
 
-    # occupant continuity
-    day_col_occ= { d:{1:["" for _ in range(slots_per_day)],
-                      2:["" for _ in range(slots_per_day)]}
-                   for d in range(days)}
-
+    occupant1={}
+    occupant2={}
     for d in range(days):
-        occupant1=None
-        occupant2=None
         for h in range(slots_per_day):
             assigned= sorted(day_hour_emps[d][h])
-            coverage_count[(d,h)]= len(assigned)  # could be 0..2
-            # keep occupant1 if occupant1 in assigned
-            if occupant1 in assigned:
-                assigned.remove(occupant1)
+            if len(assigned)==0:
+                occupant1[(d,h)]="NA"
+                occupant2[(d,h)]="NA"
+            elif len(assigned)==1:
+                occupant1[(d,h)]= assigned[0]
+                occupant2[(d,h)]="NA"
             else:
-                occupant1=None
-            if occupant2 in assigned:
-                assigned.remove(occupant2)
-            else:
-                occupant2=None
+                occupant1[(d,h)]= assigned[0]
+                occupant2[(d,h)]= assigned[1]
 
-            if occupant1 is None and assigned:
-                occupant1= assigned.pop(0)
-            if occupant2 is None and assigned:
-                occupant2= assigned.pop(0)
-
-            day_col_occ[d][1][h]= occupant1 if occupant1 else ""
-            day_col_occ[d][2][h]= occupant2 if occupant2 else ""
-
-    # build occupant blocks so we only print occupant once
-    day_col_blocks= { d:{1:[], 2:[]} for d in range(days)}
-    for d in range(days):
-        for col in [1,2]:
-            occupant_list= day_col_occ[d][col]
-            h=0
-            while h< slots_per_day:
-                name= occupant_list[h]
-                if name=="":
-                    day_col_blocks[d][col].append((h,h,""))
-                    h+=1
-                else:
-                    startH=h
-                    while (h+1<slots_per_day) and occupant_list[h+1]== name:
-                        h+=1
-                    endH=h
-                    day_col_blocks[d][col].append((startH,endH,name))
-                    h+=1
-
-    occupantPrint= { d:{col:[""]*slots_per_day for col in [1,2]} for d in range(days)}
-    for d in range(days):
-        for col in [1,2]:
-            for (startH,endH,name) in day_col_blocks[d][col]:
-                occupantPrint[d][col][startH]= name
-
-    # build table
     headers=["Time"]
     for d in range(days):
         headers.append(f"{day_names[d]}-1")
@@ -379,23 +377,11 @@ def export_schedule_to_csv(schedule, employees, solver, total_shifts_vars, desir
 
     rows=[]
     for hour in range(slots_per_day):
-        timeLabel= f"{11+hour}:00 - {12+hour}:00"
-        row_cells= [timeLabel]
+        time_str= f"{11+hour}:00 - {12+hour}:00"
+        row_cells=[time_str]
         for d in range(days):
-            cov= coverage_count[(d,hour)]
-            c1= occupantPrint[d][1][hour]
-            c2= occupantPrint[d][2][hour]
-            if cov==0:
-                c1="NA"
-                c2="NA"
-            elif cov==1:
-                # occupant2 => NA
-                if not c1 and c2:
-                    c1, c2 = c2, "NA"
-                elif not c2:
-                    c2="NA"
-            row_cells.append(c1)
-            row_cells.append(c2)
+            row_cells.append( occupant1[(d,hour)] )
+            row_cells.append( occupant2[(d,hour)] )
         rows.append(row_cells)
 
     rows.append([])
@@ -409,17 +395,19 @@ def export_schedule_to_csv(schedule, employees, solver, total_shifts_vars, desir
     with open(filename,"w", newline="", encoding="utf-8") as f:
         writer= csv.writer(f)
         writer.writerow(headers)
-        for r in rows:
-            writer.writerow(r)
+        for row in rows:
+            writer.writerow(row)
 
     print(f"Exported schedule to '{filename}'.")
 
-# ========================== 5) Single-Page Tkinter GUI with fallback & partial coverage + "NA" + coverage=2 ==========================
+
+# ========================== 5) Single-Page Tkinter GUI with fallback coverage ==========================
 class SinglePageSchedulerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Employee Scheduler - Single Page with fallback coverage")
+        self.root.title("Scheduler with leftover NA grouped, occupant repeated each hour")
 
+        # Global constraints
         fm_global= tk.LabelFrame(root, text="Global Constraints", padx=5, pady=5)
         fm_global.pack(fill='x', padx=10, pady=5)
 
@@ -441,7 +429,7 @@ class SinglePageSchedulerGUI:
 
         self.emp_rows_frame= tk.Frame(fm_emp)
         self.emp_rows_frame.grid(row=1, column=0, columnspan=3)
-        self.emp_rows= []
+        self.emp_rows=[]
 
         fm_forb= tk.LabelFrame(root, text="Forbidden Pairs", padx=5, pady=5)
         fm_forb.pack(fill='x', padx=10, pady=5)
@@ -471,6 +459,7 @@ class SinglePageSchedulerGUI:
             n= int(self.num_emp_var.get())
         except:
             n=3
+
         for i in range(n):
             rowf= tk.Frame(self.emp_rows_frame)
             rowf.pack(fill='x', pady=3)
@@ -486,7 +475,7 @@ class SinglePageSchedulerGUI:
             e_ds= tk.Entry(rowf, textvariable=ds_var, width=3)
             e_ds.pack(side='left', padx=5)
 
-            tk.Label(rowf, text="Availability\n(day start end or 'all'; lines)\n(We do half-open => end - 1 if needed)").pack(side='left', padx=5)
+            tk.Label(rowf, text="Availability\n(day start end)\nWe do half-open => end-1").pack(side='left', padx=5)
             txt_avail= tk.Text(rowf, width=30, height=3)
             txt_avail.pack(side='left', padx=5)
 
@@ -505,16 +494,18 @@ class SinglePageSchedulerGUI:
         employees_availability={}
         desired_shifts_map={}
 
+        # parse employees
         for (name_var, ds_var, txt_avail) in self.emp_rows:
             name= name_var.get().strip()
             if not name:
-                messagebox.showerror("Error", "Empty employee name.")
+                messagebox.showerror("Error","Empty employee name.")
                 return
             try:
                 ds= int(ds_var.get())
             except:
-                messagebox.showerror("Error", f"{name}: invalid desired shift.")
+                messagebox.showerror("Error",f"{name}: invalid desired shift.")
                 return
+
             lines= txt_avail.get("1.0","end").strip().split("\n")
             avset= set()
             for ln in lines:
@@ -531,29 +522,24 @@ class SinglePageSchedulerGUI:
                         sh= int(parts[1])
                         eh= int(parts[2])
 
-                        # subtract 1 from end => half-open range [sh..eh-1)
-                        eh_adjusted= eh - 1
-                        if eh_adjusted < sh:
-                            # no interval
+                        # half-open => subtract 1 from end
+                        eh_adj= eh -1
+                        if eh_adj< sh:
                             continue
-
-                        if 1<= day<=7:
-                            d_idx= day-1
-                            # clamp to [11..22] if needed
-                            if sh<11: 
-                                sh= 11
-                            if eh_adjusted> 22: 
-                                eh_adjusted=22
-                            for hour in range(sh, eh_adjusted+1):
-                                slot_index= hour - 11
-                                if 0 <= slot_index < 12:
-                                    slot_id= d_idx*12 + slot_index
-                                    avset.add(slot_id)
-                        else:
-                            messagebox.showerror("Error", f"Invalid line '{ln}' => day out of range 1..7.")
+                        if day<1 or day>7:
+                            messagebox.showerror("Error", f"Invalid day in line '{ln}' => out of range [1..7]")
                             return
+                        d_idx= day-1
+                        # clamp to [11..22]
+                        if sh<11: sh=11
+                        if eh_adj>22: eh_adj=22
+                        for hour in range(sh, eh_adj+1):
+                            slot_index= hour-11
+                            if 0<= slot_index<12:
+                                slot_id= d_idx*12 + slot_index
+                                avset.add(slot_id)
                     except:
-                        messagebox.showerror("Error", f"Invalid line '{ln}' for {name}. expect 'day start end'")
+                        messagebox.showerror("Error", f"Invalid line '{ln}' for {name}. Expect 'day start end'.")
                         return
                 else:
                     messagebox.showerror("Error", f"Invalid line '{ln}' for {name}.")
@@ -561,20 +547,21 @@ class SinglePageSchedulerGUI:
             employees_availability[name]= avset
             desired_shifts_map[name]= ds
 
-        lines_forb= self.forbidden_text.get("1.0","end").strip().split("\n")
+        # parse forbidden
+        forb_lines= self.forbidden_text.get("1.0","end").strip().split("\n")
         forbidden_pairs=[]
-        for ln in lines_forb:
+        for ln in forb_lines:
             ln= ln.strip()
             if not ln:
                 continue
-            parts= ln.split()
-            if len(parts)==2:
-                forbidden_pairs.append((parts[0], parts[1]))
+            pair= ln.split()
+            if len(pair)==2:
+                forbidden_pairs.append((pair[0], pair[1]))
             else:
-                messagebox.showerror("Error", f"Invalid forbidden pair '{ln}' (emp1 emp2).")
+                messagebox.showerror("Error", f"Invalid forbidden pair '{ln}'.")
                 return
 
-        # 1) Attempt main coverage=2 solve
+        # 1) main solve coverage=2
         schedule_main, solver_main, status_main, tsv_main= solve_scheduling_main(
             employees_availability,
             global_min_hours=gmin,
@@ -583,17 +570,17 @@ class SinglePageSchedulerGUI:
             desired_shifts= desired_shifts_map
         )
         if schedule_main is not None:
-            self.result_text.insert("end", f"Main solve found coverage=2 schedule! status={status_main}\n")
+            self.result_text.insert("end", f"Main solve => coverage=2 success! status={status_main}\n")
             for e in employees_availability:
                 hrs= len(schedule_main[e])
                 got= solver_main.Value(tsv_main[e])
-                self.result_text.insert("end", f"  {e}: {hrs} hours, desired={desired_shifts_map[e]}, got={got}\n")
+                self.result_text.insert("end", f"  {e}: {hrs} hrs, desired={desired_shifts_map[e]}, got={got}\n")
             self.schedule_data= (schedule_main, solver_main, tsv_main, desired_shifts_map)
             self.export_btn.config(state='normal')
         else:
-            self.result_text.insert("end", f"Main solve infeasible. status={status_main}\n")
-            self.result_text.insert("end", "Attempting fallback partial coverage solve...\n")
-            # 2) fallback coverage <=2, maximize coverage
+            # fallback coverage => single contiguous block or full day => leftover NA grouped
+            self.result_text.insert("end", f"Main solve infeasible => status={status_main}\n")
+            self.result_text.insert("end", "Attempt fallback coverage...\n")
             schedule_fb, solver_fb, status_fb, tsv_fb= solve_scheduling_fallback(
                 employees_availability,
                 global_min_hours=gmin,
@@ -602,15 +589,15 @@ class SinglePageSchedulerGUI:
                 desired_shifts= desired_shifts_map
             )
             if schedule_fb is None:
-                self.result_text.insert("end", f"Fallback also infeasible. status={status_fb}\nNo schedule can be produced.\n")
+                self.result_text.insert("end", f"Fallback also infeasible => status={status_fb}\nNo schedule.\n")
             else:
-                self.result_text.insert("end", f"Fallback partial coverage success! status={status_fb}\n")
+                self.result_text.insert("end", f"Fallback partial coverage success => status={status_fb}\n(Leftover NA hours grouped morning or night)\n")
                 coverage_sum= sum(len(schedule_fb[e]) for e in employees_availability)
-                self.result_text.insert("end", f"Coverage used = {coverage_sum}\n(some hours partially or not covered => NA)\n")
+                self.result_text.insert("end", f"Coverage used= {coverage_sum}\n")
                 for e in employees_availability:
                     hrs= len(schedule_fb[e])
                     got= solver_fb.Value(tsv_fb[e])
-                    self.result_text.insert("end", f"  {e}: {hrs} hours, desired={desired_shifts_map[e]}, got={got}\n")
+                    self.result_text.insert("end", f"  {e}: {hrs} hrs, desired={desired_shifts_map[e]}, got={got}\n")
                 self.schedule_data= (schedule_fb, solver_fb, tsv_fb, desired_shifts_map)
                 self.export_btn.config(state='normal')
 
@@ -622,7 +609,14 @@ class SinglePageSchedulerGUI:
         if not filename:
             return
         schedule, solver, total_shifts_vars, desired_shifts_map= self.schedule_data
-        export_schedule_to_csv(schedule, list(schedule.keys()), solver, total_shifts_vars, desired_shifts_map, filename)
+        export_schedule_to_csv(
+            schedule, 
+            list(schedule.keys()), 
+            solver, 
+            total_shifts_vars, 
+            desired_shifts_map, 
+            filename
+        )
         messagebox.showinfo("Export","CSV exported successfully!")
 
 
